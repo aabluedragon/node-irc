@@ -1229,21 +1229,47 @@ export class Client extends EventEmitter {
             }
             buffer = Buffer.concat([buffer, chunk]);
 
-            const lines = this.convertEncoding(buffer).toString().split(lineDelimiter);
+            //
+            // Split buffer by \r\n OR \r OR \n
+            //
+            const buffers:Uint8Array[] = [];
+            const accumulated:number[] = []
+            for(let i=0;i<buffer.length;i++) {
+                const byte = buffer[i];
+                const nextByte = buffer?.[i+1];
+                if(byte===13) {
+                    buffers.push(new Uint8Array(accumulated));
+                    accumulated.splice(0,accumulated.length);
+                    if(nextByte==10) {
+                        i++;
+                    }
+                    continue;
+                } else if(nextByte===10) {
+                    buffers.push(new Uint8Array(accumulated));
+                    accumulated.splice(0,accumulated.length);
+                    continue;
+                }
+                accumulated.push(byte);
+            }
+            buffers.push(new Uint8Array(accumulated));
+            // END buffer splitting logic
 
+            const lines = buffers.map(buf=>this.convertEncoding(Buffer.from(buf)).toString());
             if (lines.pop()) {
                 // if buffer is not ended with \r\n, there's more chunks.
                 return;
             }
+
             // else, initialize the buffer.
             buffer = Buffer.alloc(0);
 
-
-            lines.forEach((line) => {
+            for(let i=0; i<lines.length;i++) {
+                const line = lines[i];
                 if (!line.length) {
                     return;
                 }
                 const message = parseMessage(line, this.opt.stripColors);
+                message.buffer = buffers[i];
                 try {
                     this.emit('raw', message);
                 }
@@ -1252,7 +1278,7 @@ export class Client extends EventEmitter {
                         throw err;
                     }
                 }
-            });
+            }
         });
         this.conn.addListener('end', () => {
             if (this.opt.debug) {
