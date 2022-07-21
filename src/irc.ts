@@ -1254,7 +1254,7 @@ export class Client extends EventEmitter {
             buffers.push(new Uint8Array(accumulated));
             // END buffer splitting logic
 
-            const lines = buffers.map(buf=>this.convertEncoding(Buffer.from(buf)).toString());
+            const lines = buffers.map(buf=>Buffer.from(buf).toString('utf-8'));
             if (lines.pop()) {
                 // if buffer is not ended with \r\n, there's more chunks.
                 return;
