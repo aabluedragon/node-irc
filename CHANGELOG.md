@@ -1,3 +1,35 @@
+1.5.0 (2022-10-03)
+==================
+
+Internal Changes
+----------------
+
+- Add support for testing against an actual IRCD. ([\#94](https://github.com/matrix-org/node-irc/issues/94))
+
+
+1.4.0 (2022-09-22)
+==================
+
+**Please note:** Minimum Node.JS version is now 16
+
+Features
+--------
+
+- The `Client` class now uses strong typing for it's emitter. ([\#91](https://github.com/matrix-org/node-irc/issues/91))
+
+
+Bugfixes
+--------
+
+- Prevent connection immediately terminating on expired certificate when allowed by config. Contributed by @f0x52. ([\#90](https://github.com/matrix-org/node-irc/issues/90))
+
+
+Deprecations and Removals
+-------------------------
+
+- Drop support for Node 12,14 and support Node 16+. ([\#92](https://github.com/matrix-org/node-irc/issues/92))
+
+
 1.2.1 (2022-05-04)
 ===================
 

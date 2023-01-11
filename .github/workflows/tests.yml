@@ -14,29 +14,40 @@ jobs:
     - name: Use Node.js
       uses: actions/setup-node@v1
       with:
-        node-version: 14
-    - run: npm i
-    - run: npm run lint
+        node-version: 16
+    - run: yarn
+    - run: yarn lint
   test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node_version: [12, 14, 16]
+        node_version: [16, 18]
     steps:
       - uses: actions/checkout@v2
       - name: Use Node.js ${{ matrix.node_version }}
         uses: actions/setup-node@v1
         with:
           node-version: ${{ matrix.node_version }}
-      - run: npm i
-      - run: npm run test
-  changelog:
+      - run: yarn
+      - run: yarn test
+  integration:
     runs-on: ubuntu-latest
-    steps:
+    strategy:
+      matrix:
+        node_version: [16, 18]
+    steps:      
       - uses: actions/checkout@v2
+      # Setup the IRCD
+      - name: Setup inspircd
+        run: |
+          sudo apt update
+          sudo apt install inspircd
+          sudo cp .github/support/inspircd.conf /etc/inspircd/inspircd.conf
+          sudo ls -l /etc/inspircd/
+          sudo inspircd --runasroot --nopid
+      - name: Use Node.js ${{ matrix.node_version }}
+        uses: actions/setup-node@v1
         with:
-          fetch-depth: 0
-      - uses: actions/setup-python@v2
-        with:
-          python-version: 3.6
-      - run: scripts/changelog-check.sh
+          node-version: ${{ matrix.node_version }}
+      - run: yarn
+      - run: yarn test:integration
