@@ -128,16 +128,8 @@ export type IrcConnectionEventsMap = {
     connect: () => void,
 }
 
-export type IrcConnectionEventEmitter = TypedEmitter<IrcConnectionEventsMap>;
-
-export interface IrcConnection extends IrcConnectionEventEmitter {
-    connecting: boolean;
-    setTimeout(arg0: number): unknown;
-    destroy(): unknown;
-    write(data: string): void;
-    end(): void,
-}
-
+export type IrcConnectionEventEmitter = Socket;
+export interface IrcConnection extends IrcConnectionEventEmitter {}
 
 export type SaslErrors = "err_saslfail" | "err_sasltoolong" | "err_saslaborted" | "err_saslalready";
 
