@@ -18,7 +18,7 @@
     along with this library.  If not, see <http://www.gnu.org/licenses/>.
 */
 import * as dns from 'dns';
-import { createConnection, TcpNetConnectOpts } from 'net';
+import { createConnection, Socket, TcpNetConnectOpts } from 'net';
 import * as tls from 'tls';
 import * as util from 'util';
 import isValidUTF8 from 'utf-8-validate';
