@@ -2,7 +2,7 @@
     irc.js - Node JS IRC client library
 
     Copyright 2010 Martyn Smith
-    Copyright 2020-2021 The Matrix.org Foundation C.I.C
+    Copyright 2020-2023 The Matrix.org Foundation C.I.C
 
     This library is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -18,7 +18,7 @@
     along with this library.  If not, see <http://www.gnu.org/licenses/>.
 */
 import * as dns from 'dns';
-import { Socket, createConnection, TcpNetConnectOpts } from 'net';
+import { createConnection, TcpNetConnectOpts } from 'net';
 import * as tls from 'tls';
 import * as util from 'util';
 import isValidUTF8 from 'utf-8-validate';
@@ -26,48 +26,18 @@ import { EventEmitter } from 'events';
 import * as Iconv from 'iconv-lite';
 import * as detectCharset from 'chardet';
 import { Message, parseMessage } from './parse_message';
-import { IrcCapabilities } from './capabilities';
 import splitLongLines from './splitLines';
 import TypedEmitter from "typed-emitter";
 import { ClientEvents, CtcpEventIndex, JoinEventIndex, MessageEventIndex, PartEventIndex } from './events';
+import { DefaultIrcSupported, IrcClientState, IrcInMemoryState, WhoisResponse } from './state';
 
 const lineDelimiter = new RegExp('\r\n|\r|\n');
 const MIN_DELAY_MS = 33;
-
-export interface ChanData {
-    created?: string;
-    key: string;
-    serverName: string;
-    /**
-     * nick => mode
-     */
-    users: Map<string, string>,
-    mode: string;
-    modeParams: Map<string, string[]>,
-    topic?: string;
-    topicBy?: string;
-}
 
 export interface ChanListItem {
     name: string;
     users: string;
     topic: string;
-}
-
-export interface WhoisResponse {
-    nick: string;
-    user?: string;
-    channels?: string[];
-    host?: string;
-    realname?: string;
-    away?: string;
-    idle?: string;
-    server?: string;
-    serverinfo?: string;
-    operator?: string;
-    account?: string;
-    accountinfo?: string;
-    realHost?: string;
 }
 
 export interface IrcClientOpts {
@@ -149,94 +119,73 @@ interface IrcClientOptInternal extends IrcClientOpts {
     };
 }
 
-interface IrcSupported {
-    channel: {
-        idlength: {[key: string]: string};
-        length: number;
-        limit: {[key: string]: number};
-        // https://www.irc.info/articles/rpl_isupport
-        modes: {
-            /**
-             * Always take a parameter when specified by the server.
-             * May have a parameter when specificed by the client.
-             */
-            a: string;
-            /**
-             * Alwyas take a parameter.
-             */
-            b: string;
-            /**
-             * Take a parameter when set, absent when removed.
-             */
-            c: string;
-            /**
-             * Never take a parameter.
-             */
-            d: string;
-        },
-        types: string;
-    };
-    maxlist: {[key: string]: number};
-    maxtargets:{[key: string]: number};
-    modes: number;
-    nicklength: number;
-    topiclength: number;
-    kicklength: number;
-    usermodes: string;
-    usermodepriority: string; // E.g "ov"
-    // http://www.irc.org/tech_docs/005.html
-    casemapping: 'ascii'|'rfc1459'|'strict-rfc1459';
-    extra: string[];
-
+export type IrcConnectionEventsMap = {
+    error: (err: Error) => void,
+    data: (chunk: Buffer) => void,
+    end: () => void,
+    close: () => void,
+    timeout: () => void,
+    connect: () => void,
 }
+
+export type IrcConnectionEventEmitter = TypedEmitter<IrcConnectionEventsMap>;
+
+export interface IrcConnection extends IrcConnectionEventEmitter {
+    connecting: boolean;
+    setTimeout(arg0: number): unknown;
+    destroy(): unknown;
+    write(data: string): void;
+    end(): void,
+}
+
 
 export type SaslErrors = "err_saslfail" | "err_sasltoolong" | "err_saslaborted" | "err_saslalready";
 
-
 export class Client extends (EventEmitter as unknown as new () => TypedEmitter<ClientEvents>) {
     private sendingPromise = Promise.resolve();
-    private lastSendTime = 0;
-    private nickMod = 0;
     private opt: IrcClientOptInternal;
-    private hostMask = '';
     private prevClashNick = '';
-    private _maxLineLength = 0;
-    public conn?: Socket|tls.TLSSocket;
     private requestedDisconnect = false;
-    private supportedState: IrcSupported;
-    private capabilities: IrcCapabilities;
-    private loggedIn: boolean|null = null;
+
     /**
-     * Cached data
+     * Is the socket in use by this instance created by us, or passed in.
      */
-    private whoisData = new Map<string, WhoisResponse>();
-    public chans = new Map<string, ChanData>();
-    public readonly prefixForMode: {[mode: string]: string} = {}; // o => @
-    public readonly modeForPrefix: {[prefix: string]: string} = {}; // @ => o
+    private isOurSocket = false;
 
     /**
      * These variables are used to build up state and should be discarded after use.
      */
-    private motd?: string = "";
+    private motd? = "";
     private channelListState?: ChanListItem[];
+    private buffer = Buffer.alloc(0);
 
-    /**
-     * This will either be the requested nick or the actual nickname.
-     */
-    private currentNick: string;
+    private readonly state: IrcClientState;
 
-    get nick() {
-        return this.currentNick;
+    get modeForPrefix() {
+        return this.state.modeForPrefix;
     }
 
-    get supported(): IrcSupported {
+    get chans() {
+        return this.state.chans;
+    }
+
+    get nick() {
+        return this.state.currentNick;
+    }
+
+    get supported() {
         return {
-            ...this.supportedState,
+            ...this.state.supportedState,
         };
     }
 
     get maxLineLength(): number {
-        return this._maxLineLength;
+        // 497 = 510 - (":" + "!" + " PRIVMSG " + " :").length;
+        return 497 - this.state.currentNick.length - this.state.hostMask.length;
+    }
+
+    get hostMask() {
+        return this.state.hostMask;
     }
 
     /**
@@ -244,17 +193,47 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
      * This will be null if this could not be determined.
      */
     get isLoggedIn() {
-        return this.loggedIn;
+        return this.state.loggedIn;
     }
 
-    constructor (private server: string, requestedNick: string, opt: IrcClientOpts) {
+    constructor (
+        private server: string, requestedNick: string, opt: IrcClientOpts, existingState?: IrcClientState,
+        public conn?: IrcConnection
+    ) {
         super();
-        this.currentNick = requestedNick;
+        if (!existingState) {
+            this.state = new IrcInMemoryState(
+                DefaultIrcSupported,
+            );
+        }
+        else {
+            this.state = existingState;
+        }
+
+        this.isOurSocket = !conn;
+
+        if (!this.state.currentNick) {
+            this.state.currentNick = requestedNick;
+        } // Otherwise, we already have a nick.
+
+        if (opt.channelPrefixes) {
+            this.state.supportedState.channel.types = opt.channelPrefixes;
+        }
+        this.state.capabilities.once('serverCapabilitesReady', () => {
+            this.onCapsList();
+            // Flush on capabilities modified
+            this.state.flush?.();
+        })
+        this.state.capabilities.once('userCapabilitesReady', () => {
+            this.onCapsConfirmed();
+            // Flush on capabilities modified
+            this.state.flush?.();
+        })
         /**
          * This promise is used to block new sends until the previous one completes.
          */
         this.sendingPromise = Promise.resolve();
-        this.lastSendTime = 0;
+        this.state.lastSendTime = 0;
         this.opt = {
             password: null,
             userName: 'nodebot',
@@ -290,32 +269,8 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
             ...opt,
             family: opt.family ? opt.family : 4,
         };
-        this.nickMod = opt.nickMod ?? 0;
+        this.state.nickMod = opt.nickMod ?? 0;
 
-        // Features supported by the server
-        // (initial values are RFC 1459 defaults. Zeros signify
-        // no default or unlimited value)
-        this.supportedState = {
-            channel: {
-                idlength: {},
-                length: 200,
-                limit: {},
-                modes: { a: '', b: '', c: '', d: ''},
-                types: this.opt.channelPrefixes
-            },
-            kicklength: 0,
-            maxlist: {},
-            maxtargets: {},
-            modes: 3,
-            nicklength: 9,
-            topiclength: 0,
-            usermodes: '',
-            usermodepriority: '', // E.g "ov"
-            casemapping: 'ascii',
-            extra: [],
-        };
-
-        this.capabilities = new IrcCapabilities(this.onCapsList.bind(this), this.onCapsConfirmed.bind(this));
 
         super.on('raw', this.onRaw.bind(this));
 
@@ -358,7 +313,7 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
             return;
         }
         // otherwise, we should authenticate
-        if (this.capabilities.supportsSaslMethod(this.opt.saslType, true)) {
+        if (this.state.capabilities.supportsSaslMethod(this.opt.saslType, true)) {
             this._send('AUTHENTICATE', this.opt.saslType);
         }
         else {
@@ -370,7 +325,7 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         // Set nick to whatever the server decided it really is
         // (normally this is because you chose something too long and
         // the server has shortened it
-        this.currentNick = message.args[0];
+        this.state.currentNick = message.args[0];
         // Note our hostmask to use it in splitting long messages.
         // We don't send our hostmask when issuing PRIVMSGs or NOTICEs,
         // of course, but rather the servers on the other side will
@@ -378,22 +333,25 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         // the string is too long. Therefore, we need to be considerate
         // neighbors and truncate our messages accordingly.
         const welcomeStringWords = message.args[1].split(/\s+/);
-        this.hostMask = welcomeStringWords[welcomeStringWords.length - 1];
-        this._updateMaxLineLength();
+        this.state.hostMask = welcomeStringWords[welcomeStringWords.length - 1];
         this.emit('registered');
-        this.whois(this.currentNick, (args) => {
+        this.state.registered = true;
+        // Flush because we've made several state changes.
+        this.state.flush?.();
+        this.whois(this.state.currentNick, (args) => {
             if (!args) {
                 // TODO: We can't find our own nick, so do nothing here.
-                return
+                return;
             }
-            this.currentNick = args.nick;
-            this.hostMask = args.user + "@" + args.host;
-            this._updateMaxLineLength();
+            this.state.currentNick = args.nick;
+            this.state.hostMask = args.user + "@" + args.host;
+            this.state.flush?.();
         });
     }
 
     private onReplyMyInfo(message: Message) {
-        this.supportedState.usermodes = message.args[3];
+        this.state.supportedState.usermodes = message.args[3];
+        this.state.flush?.();
     }
 
     private onReplyISupport(message: Message) {
@@ -409,60 +367,60 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
                 case 'CASEMAPPING':
                     // We assume this is fine.
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                    this.supportedState.casemapping = value as any;
+                    this.state.supportedState.casemapping = value as any;
                     break;
                 case 'CHANLIMIT':
                     value.split(',').forEach((val) => {
                         const [val0, val1] = val.split(':');
-                        this.supportedState.channel.limit[val0] = parseInt(val1);
+                        this.state.supportedState.channel.limit[val0] = parseInt(val1);
                     });
                     break;
                 case 'CHANMODES': {
                     const values = value.split(',');
                     const type: ['a', 'b', 'c', 'd'] = ['a', 'b', 'c', 'd'];
                     for (let i = 0; i < type.length; i++) {
-                        this.supportedState.channel.modes[type[i]] += values[i];
+                        this.state.supportedState.channel.modes[type[i]] += values[i];
                     }
                     break;
                 }
                 case 'CHANTYPES':
-                    this.supportedState.channel.types = value;
+                    this.state.supportedState.channel.types = value;
                     break;
                 case 'CHANNELLEN':
-                    this.supportedState.channel.length = parseInt(value);
+                    this.state.supportedState.channel.length = parseInt(value);
                     break;
                 case 'IDCHAN':
                     value.split(',').forEach((val) => {
                         const [val0, val1] = val.split(':');
-                        this.supportedState.channel.idlength[val0] = val1;
+                        this.state.supportedState.channel.idlength[val0] = val1;
                     });
                     break;
                 case 'KICKLEN':
-                    this.supportedState.kicklength = parseInt(value);
+                    this.state.supportedState.kicklength = parseInt(value);
                     break;
                 case 'MAXLIST':
                     value.split(',').forEach((val) => {
                         const [val0, val1] = val.split(':');
-                        this.supportedState.maxlist[val0] = parseInt(val1);
+                        this.state.supportedState.maxlist[val0] = parseInt(val1);
                     });
                     break;
                 case 'NICKLEN':
-                    this.supportedState.nicklength = parseInt(value);
+                    this.state.supportedState.nicklength = parseInt(value);
                     break;
                 case 'PREFIX': {
                     match = value.match(/\((.*?)\)(.*)/);
                     if (match) {
-                        this.supportedState.usermodepriority = match[1];
+                        this.state.supportedState.usermodepriority = match[1];
                         const match1 = match[1].split('');
                         const match2 = match[2].split('');
                         while (match1.length) {
-                            this.modeForPrefix[match2[0]] = match1[0];
-                            this.supportedState.channel.modes.b += match1[0];
+                            this.state.modeForPrefix[match2[0]] = match1[0];
+                            this.state.supportedState.channel.modes.b += match1[0];
                             const idx = match1.shift();
                             if (idx) {
                                 const result = match2.shift();
                                 if (result) {
-                                    this.prefixForMode[idx] = result;
+                                    this.state.prefixForMode[idx] = result;
                                 }
                             }
                         }
@@ -476,24 +434,26 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
                         const [key, v] = val.split(':');
                         const targValue = v ?? parseInt(v);
                         if (typeof targValue === 'number') {
-                            this.supportedState.maxtargets[key] = targValue;
+                            this.state.supportedState.maxtargets[key] = targValue;
                         }
                     });
                     break;
                 }
                 case 'TOPICLEN':
-                    this.supportedState.topiclength = parseInt(value);
+                    this.state.supportedState.topiclength = parseInt(value);
                     break;
                 default:
-                    this.supportedState.extra.push(value);
+                    this.state.supportedState.extra.push(value);
                     break;
             }
         });
+        // We've probably mutated the supported state, so flush the state
+        this.state.flush?.();
     }
 
     private onErrNicknameInUse(message: Message) {
         let nextNick = this.opt.onNickConflict();
-        if (this.nickMod > 1) {
+        if (this.state.nickMod > 1) {
             // We've already tried to resolve this nick before and have failed to do so.
             // This could just be because there are genuinely 2 clients with the
             // same nick and the same nick with a numeric suffix or it could be much
@@ -519,8 +479,9 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         }
 
         this._send('NICK', nextNick);
-        this.currentNick = nextNick;
-        this._updateMaxLineLength();
+        this.state.currentNick = nextNick;
+        // Flush on nick update.
+        this.state.flush?.();
     }
 
     private onNotice(message: Message) {
@@ -600,11 +561,11 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
             }
             const eventName = (adding ? '+' : '-') + 'mode' as '+mode'|'-mode';
             const supported = this.supported.channel.modes;
-            if (mode in this.prefixForMode) {
+            if (mode in this.state.prefixForMode) {
                 // channel user modes
                 const user = modeArgs.shift();
                 const currUserMode = user && channel.users.get(user);
-                const prefix = this.prefixForMode[mode];
+                const prefix = this.state.prefixForMode[mode];
                 if (user && currUserMode !== undefined) {
                     if (adding && !currUserMode?.includes(prefix)) {
                         channel.users.set(user, currUserMode + prefix);
@@ -636,6 +597,8 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
                 this.emit(eventName, chanName, from, mode, undefined, message);
             }
         });
+        // Flush any channel data updates.
+        this.state.flush?.();
     }
 
     private onNick(message: Message) {
@@ -644,8 +607,8 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         }
         if (message.nick === this.nick) {
             // the user just changed their own nick
-            this.currentNick = message.args[0];
-            this._updateMaxLineLength();
+            this.state.currentNick = message.args[0];
+            this.state.flush?.();
         }
 
         if (this.opt.debug) {
@@ -655,7 +618,7 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         const channelsForNick: string[] = [];
 
         // finding what channels a user is in
-        Object.entries(this.chans).forEach(([channame, nickChannel]) => {
+        this.state.chans.forEach((nickChannel, channame) => {
             const chanUser = message.nick && nickChannel.users.get(message.nick);
             if (message.nick && chanUser) {
                 nickChannel.users.set(message.args[0], chanUser);
@@ -663,6 +626,8 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
                 channelsForNick.push(channame);
             }
         });
+        // Flush changes to the channel membership
+        this.state.flush?.();
 
         // old nick, new nick, channels
         this.emit('nick', message.nick, message.args[0], channelsForNick, message);
@@ -695,7 +660,7 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         users.forEach(user => {
             // user = "@foo", "+foo", "&@foo", etc...
             // The symbols are the prefix set.
-            const allowedSymbols = Object.keys(this.modeForPrefix).join("");
+            const allowedSymbols = Object.keys(this.state.modeForPrefix).join("");
             // Split out the prefix from the nick e.g "@&foo" => ["@&foo", "@&", "foo"]
             const prefixRegex = new RegExp("^([" + escapeRegExp(allowedSymbols) + "]*)(.*)$");
             const match = user.match(prefixRegex);
@@ -703,7 +668,7 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
                 const userPrefixes = match[1];
                 let knownPrefixes = '';
                 for (let i = 0; i < userPrefixes.length; i++) {
-                    if (userPrefixes[i] in this.modeForPrefix) {
+                    if (userPrefixes[i] in this.state.modeForPrefix) {
                         knownPrefixes += userPrefixes[i];
                     }
                 }
@@ -717,6 +682,10 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
                 }
             }
         });
+        // If the channel user list was modified, flush.
+        if (users.length) {
+            this.state.flush?.()
+        }
     }
 
     private onReplyNameEnd(message: Message) {
@@ -750,6 +719,8 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
                 channel.topicBy = message.nick;
             }
         }
+        // Channel data updated, flush
+        this.state.flush?.();
     }
 
     private onReplyChannelList(message: Message) {
@@ -769,6 +740,8 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         const channel = this.chanData(message.args[1]);
         if (channel) {
             channel.topicBy = message.args[2];
+            // TopicBy updated, flush.
+            this.state.flush?.();
             // We *should* know the topic at this point as servers usually send a topic first,
             // but don't emit if we don't have it yet.
             if (channel.topic) {
@@ -782,6 +755,7 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         const channel = this.chanData(message.args[1]);
         if (channel) {
             channel.mode = message.args[2];
+            this.state.flush?.();
         }
 
         this.emit('mode_is', message.args[1], message.args[2]);
@@ -792,6 +766,7 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         const channel = this.chanData(message.args[1]);
         if (channel) {
             channel.created = message.args[2];
+            this.state.flush?.();
         }
     }
 
@@ -808,6 +783,8 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
             if (message.nick && channel && channel.users) {
                 channel.users.set(message.nick, '');
             }
+            // Channel modified, flush
+            this.state.flush?.();
         }
         this.emit('join', message.args[0], message.nick, message);
         this.emit(('join' + message.args[0]) as JoinEventIndex, message.nick, message);
@@ -841,6 +818,8 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
             if (channel && channel.users && message.nick) {
                 channel.users.delete(message.nick);
             }
+            // Channel modified, flush
+            this.state.flush?.();
         }
     }
 
@@ -859,18 +838,21 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
             if (channel && channel.users) {
                 channel.users.delete(message.args[1]);
             }
+            // Channel modified, flush
+            this.state.flush?.();
         }
     }
 
     private onKill(message: Message) {
         const nick = message.args[0];
         const killChannels = [];
-        for (const [channame, killChannel] of Object.entries(this.chans)) {
-            if (message.nick && message.nick in killChannel.users) {
-                delete killChannel.users[message.nick];
+        for (const [channame, killChannel] of this.state.chans.entries()) {
+            if (message.nick && killChannel.users.has(message.nick)) {
+                killChannel.users.delete(message.nick);
                 killChannels.push(channame);
             }
         }
+        this.state.flush?.();
         this.emit('kill', nick, message.args[1], killChannels, message);
     }
 
@@ -887,7 +869,7 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
             return;
         }
         this.emit('message', from, to, msgText, message);
-        if (this.supportedState.channel.types.indexOf(to.charAt(0)) !== -1) {
+        if (this.state.supportedState.channel.types.indexOf(to.charAt(0)) !== -1) {
             this.emit(
                 ('message' + to) as MessageEventIndex, from, msgText, message);
             if (to !== to.toLowerCase()) {
@@ -926,12 +908,14 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         const quitChannels: string[] = [];
 
         // finding what channels a user is in?
-        for (const [channame, quitChannel] of Object.entries(this.chans)) {
-            if (message.nick && message.nick in quitChannel.users) {
-                delete quitChannel.users[message.nick];
+        for (const [channame, quitChannel] of this.state.chans.entries()) {
+            if (message.nick && quitChannel.users.has(message.nick)) {
+                quitChannel.users.delete(message.nick);
                 quitChannels.push(channame);
             }
         }
+        // Deleting channel data, flushing
+        this.state.flush?.();
 
         // who, reason, channels
         this.emit('quit', message.nick, message.args[0], quitChannels, message);
@@ -986,8 +970,8 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         // the nick they wanted.
         const rndNick = "enick_" + Math.floor(Math.random() * 1000) // random 3 digits
         this._send('NICK', rndNick);
-        this.currentNick = rndNick;
-        this._updateMaxLineLength();
+        this.state.currentNick = rndNick;
+        this.state.flush?.();
     }
 
     private onRaw(message: Message): void {
@@ -1098,16 +1082,16 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
             case 'QUIT':
                 return this.onQuit(message);
             case 'CAP':
-                return this.capabilities.onCap(message);
+                return this.state.capabilities.onCap(message);
             case 'AUTHENTICATE':
                 return this.onAuthenticate(message);
             case 'rpl_loggedin':
                 this.emit('sasl_loggedin', message.args[0], message.args[1], message.args[2], message.args[3]);
-                this.loggedIn = true;
+                this.state.loggedIn = true;
                 break;
             case 'rpl_loggedout':
                 this.emit('sasl_loggedout', message.args[0], message.args[1], message.args[2]);
-                this.loggedIn = false;
+                this.state.loggedIn = false;
                 break;
             case 'err_saslfail':
             case 'err_sasltoolong':
@@ -1147,14 +1131,14 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
     }
 
     private onNickConflict(maxLen?: number): string {
-        if (typeof (this.nickMod) === 'undefined') {
-            this.nickMod = 0;
+        if (typeof (this.state.nickMod) === 'undefined') {
+            this.state.nickMod = 0;
         }
-        this.nickMod++;
-        let n = this.nick + this.nickMod;
+        this.state.nickMod++;
+        let n = this.nick + this.state.nickMod;
         if (maxLen && n.length > maxLen) {
             // truncate the end of the nick and then suffix a numeric
-            const digitStr = "" + this.nickMod;
+            const digitStr = "" + this.state.nickMod;
             const maxNickSegmentLen = maxLen - digitStr.length;
             n = this.nick.substr(0, maxNickSegmentLen) + digitStr;
         }
@@ -1163,15 +1147,17 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
 
     public chanData(name: string, create = false) {
         const key = name.toLowerCase();
-        const existing = this.chans.get(key);
+        const existing = this.state.chans.get(key);
         if (create && !existing) {
-            this.chans.set(key, {
+            this.state.chans.set(key, {
                 key: key,
                 serverName: name,
                 users: new Map(),
                 mode: '',
                 modeParams: new Map(),
             });
+            // Flush on channel data mutation
+            this.state.flush?.();
         }
 
         return existing;
@@ -1182,7 +1168,9 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         // Sometimes we can hit a race where we will get a PART about ourselves before we
         // have joined a channel fully and stored it in state.
         // Ensure that we have chanData before deleting
-        this.chans.delete(key);
+        this.state.chans.delete(key);
+        // Flush on channel data mutation
+        this.state.flush?.();
     }
 
     private _connectionHandler() {
@@ -1194,12 +1182,14 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
             this._send('PASS', this.opt.password);
         }
         if (this.opt.debug) {util.log('Sending irc NICK/USER');}
+        // New connection, clear chan list.
+        this.state.chans.clear();
         // Request capabilities.
         // https://ircv3.net/specs/extensions/capability-negotiation.html
         this._send('CAP LS', '302');
         this._send('NICK', this.nick);
-        this.currentNick = this.nick;
-        this._updateMaxLineLength();
+        this.state.currentNick = this.nick;
+        this.state.flush?.();
         this._send('USER', this.opt.userName, '8', '*', this.opt.realName);
         this.emit('connect');
     }
@@ -1216,7 +1206,6 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         if (typeof callback === 'function') {
             this.once('registered', callback);
         }
-        this.chans = new Map();
 
         // socket opts
         const connectionOpts: TcpNetConnectOpts = {
@@ -1269,10 +1258,13 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         }
 
         // destroy old socket before allocating a new one
-        if (this.conn) {this.conn.destroy();}
+        if (this.isOurSocket && this.conn) {
+            this.conn.destroy();
+            this.conn = undefined;
+        }
 
         // try to connect to the server
-        if (this.opt.secure) {
+        if (this.opt.secure && !this.conn) {
             let secureOpts: tls.ConnectionOptions = {
                 ...connectionOpts,
                 rejectUnauthorized: !(this.opt.selfSigned || this.opt.certExpired),
@@ -1286,123 +1278,156 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
                 };
             }
 
-            this.conn = tls.connect(secureOpts, () => {
-                if (this.conn === undefined) {
+            const tlscon: tls.TLSSocket = tls.connect(secureOpts, () => {
+                if (tlscon === undefined) {
                     throw Error('Conn was not defined');
                 }
-                if (!(this.conn instanceof tls.TLSSocket)) {
+                if (!(tlscon instanceof tls.TLSSocket)) {
                     throw Error('Conn was not a TLSSocket');
                 }
 
                 // callback called only after successful socket connection
 
-                if (!this.conn.authorized) {
-                    switch (this.conn.authorizationError.toString()) {
+                if (!tlscon.authorized) {
+                    switch (tlscon.authorizationError.toString()) {
                         case 'DEPTH_ZERO_SELF_SIGNED_CERT':
                         case 'UNABLE_TO_VERIFY_LEAF_SIGNATURE':
                         case 'SELF_SIGNED_CERT_IN_CHAIN':
                             if (!this.opt.selfSigned) {
-                                return this.conn.destroy(this.conn.authorizationError);
+                                return tlscon.destroy(tlscon.authorizationError);
                             }
                             break;
                         case 'CERT_HAS_EXPIRED':
                             if (!this.opt.certExpired) {
-                                return this.conn.destroy(this.conn.authorizationError);
+                                return tlscon.destroy(tlscon.authorizationError);
                             }
                             break;
                         default:
                             // Fail on other errors
-                            return this.conn.destroy(this.conn.authorizationError)
+                            return tlscon.destroy(tlscon.authorizationError)
                     }
                 }
                 if (!this.opt.encoding) {
-                    this.conn.setEncoding('utf-8');
+                    tlscon.setEncoding('utf-8');
                 }
-                this._connectionHandler();
             });
+            // We assert this explicitly because:
+            // - The socket connections define a listeners/rawListeners which we do not use.
+            // - Without defining those on IrcConnection, Socket does not overlap with `IrcConnection`
+            // - Therefore, we assert that this is a IrcConnection.
+            this.conn = tlscon as IrcConnection;
+        }
+        else if (!this.conn) {
+            this.conn = createConnection(connectionOpts) as IrcConnection;
+        }
+
+
+        if (this.state.registered) {
+            // The connection was previously registered, so just emit this.
+            this.emit('registered');
         }
         else {
-            this.conn = createConnection(connectionOpts, this._connectionHandler.bind(this));
+            if (this.conn.connecting) {
+                this.conn.once('connect', () => {
+                    this._connectionHandler();
+                });
+            }
+            else {
+                // Already connected
+                this._connectionHandler();
+            }
+        }
+
+        this.bindListeners(retryCount);
+    }
+
+    private onData(chunk: string|Buffer) {
+        if (typeof chunk === 'string') {
+            chunk = Buffer.from(chunk);
+        }
+        this.buffer = Buffer.concat([this.buffer, chunk]);
+
+        //
+        // Split buffer by \r\n OR \r OR \n
+        //
+        const buffers:Uint8Array[] = [];
+        const accumulated:number[] = []
+        for(let i=0;i<this.buffer.length;i++) {
+            const byte = this.buffer[i];
+            const nextByte = this.buffer?.[i+1];
+            if(byte===13) {
+                buffers.push(new Uint8Array(accumulated));
+                accumulated.splice(0,accumulated.length);
+                if(nextByte==10) {
+                    i++;
+                }
+                continue;
+            } else if(nextByte===10) {
+                buffers.push(new Uint8Array(accumulated));
+                accumulated.splice(0,accumulated.length);
+                continue;
+            }
+            accumulated.push(byte);
+        }
+        buffers.push(new Uint8Array(accumulated));
+        // END buffer splitting logic
+
+        const lines = buffers.map(buf=>Buffer.from(buf).toString('utf-8'));
+        if (lines.pop()) {
+            // if buffer is not ended with \r\n, there's more chunks.
+            return;
+        }
+        
+        // else, clear the buffer
+        this.buffer = Buffer.alloc(0);
+
+        lines.forEach((line) => {
+            if (!line.length) {
+                return;
+            }
+            const message = parseMessage(line, this.opt.stripColors);
+            try {
+                this.emit('raw', message);
+            }
+            catch (err) {
+                if (!this.requestedDisconnect) {
+                    throw err;
+                }
+            }
+        });
+    }
+
+    private bindListeners(reconnectRetryCount: number) {
+        if (!this.conn) {
+            throw Error('Connection is not ready, cannot bind listeners');
         }
 
         this.requestedDisconnect = false;
         this.conn.setTimeout(1000 * 180);
 
-        let buffer = Buffer.alloc(0);
-
-        this.conn.addListener('data', (chunk: string|Buffer) => {
-            if (typeof chunk === 'string') {
-                chunk = Buffer.from(chunk);
-            }
-            buffer = Buffer.concat([buffer, chunk]);
-
-            //
-            // Split buffer by \r\n OR \r OR \n
-            //
-            const buffers:Uint8Array[] = [];
-            const accumulated:number[] = []
-            for(let i=0;i<buffer.length;i++) {
-                const byte = buffer[i];
-                const nextByte = buffer?.[i+1];
-                if(byte===13) {
-                    buffers.push(new Uint8Array(accumulated));
-                    accumulated.splice(0,accumulated.length);
-                    if(nextByte==10) {
-                        i++;
-                    }
-                    continue;
-                } else if(nextByte===10) {
-                    buffers.push(new Uint8Array(accumulated));
-                    accumulated.splice(0,accumulated.length);
-                    continue;
-                }
-                accumulated.push(byte);
-            }
-            buffers.push(new Uint8Array(accumulated));
-            // END buffer splitting logic
-
-            const lines = buffers.map(buf=>Buffer.from(buf).toString('utf-8'));
-            if (lines.pop()) {
-                // if buffer is not ended with \r\n, there's more chunks.
-                return;
-            }
-
-            // else, initialize the buffer.
-            buffer = Buffer.alloc(0);
-
-            for(let i=0; i<lines.length;i++) {
-                const line = lines[i];
-                if (!line.length) {
-                    return;
-                }
-                const message = parseMessage(line, this.opt.stripColors);
-                message.buffer = buffers[i];
-                try {
-                    this.emit('raw', message);
-                }
-                catch (err) {
-                    if (!this.requestedDisconnect) {
-                        throw err;
-                    }
-                }
-            }
-        });
+        this.conn.on('data', this.onData.bind(this));
         this.conn.addListener('end', () => {
             if (this.opt.debug) {
                 util.log('Connection got "end" event');
             }
+            // Ensure we reset the state.
+            this.state.registered = false;
         });
         this.conn.addListener('close', () => {
             if (this.opt.debug) {
                 util.log('Connection got "close" event');
             }
-            this.reconnect(retryCount);
+            // Ensure we reset the state.
+            this.state.registered = false;
+            this.reconnect(reconnectRetryCount);
         });
         this.conn.addListener('timeout', () => {
             if (this.opt.debug) {
                 util.log('Connection got "timeout" event');
             }
-            this.reconnect(retryCount);
+            // Ensure we reset the state.
+            this.state.registered = false;
+            this.reconnect(reconnectRetryCount);
         });
         this.conn.addListener('error', (exception) => {
             if (this.opt.debug) {
@@ -1413,6 +1438,11 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
     }
 
     private reconnect(retryCount: number) {
+        if (!this.isOurSocket) {
+            // Cannot reconnect if the socket is not ours.
+            this.emit('abort', 0);
+            return;
+        }
         if (this.requestedDisconnect) {return;}
         if (this.opt.debug) {util.log('Disconnected: reconnecting');}
         if (this.opt.retryCount !== null && retryCount >= this.opt.retryCount) {
@@ -1429,6 +1459,21 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         setTimeout(() => {
             this.connect(retryCount + 1);
         }, this.opt.retryDelay);
+    }
+
+    /**
+     * Destory the client. If the socket was passed in via the constructor, this does NOT disconnect but instead
+     * unmaps the client instance from the socket. The state will also need to be cleared up seperately.
+     */
+    public destroy() {
+        (
+            ['data', 'end', 'close', 'timeout', 'error'] as (keyof IrcConnectionEventsMap)[]
+        ).forEach(evtType => {
+            this.conn?.removeAllListeners(evtType);
+        });
+        if (this.isOurSocket) {
+            this.disconnect();
+        }
     }
 
     public disconnect(messageOrCallback?: string|(() => void), callback?: () => void) {
@@ -1461,7 +1506,7 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
             // Get the amount of time we should wait between messages
             const delay = this.opt.floodProtectionDelay - Math.min(
                 this.opt.floodProtectionDelay,
-                Date.now() - this.lastSendTime,
+                Date.now() - this.state.lastSendTime,
             );
             if (delay > MIN_DELAY_MS) {
                 delayPromise = new Promise((r) => setTimeout(r, delay));
@@ -1493,7 +1538,7 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         if (this.requestedDisconnect) {
             return;
         }
-        this.lastSendTime = Date.now();
+        this.state.lastSendTime = Date.now();
         this.conn.write(args.join(' ') + '\r\n');
     }
 
@@ -1549,18 +1594,18 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
 
     // E.g. isUserPrefixMorePowerfulThan("@", "&")
     public isUserPrefixMorePowerfulThan(prefix: string, testPrefix: string): boolean {
-        const mode = this.modeForPrefix[prefix];
-        const testMode = this.modeForPrefix[testPrefix];
-        if (this.supportedState.usermodepriority.length === 0 || !mode || !testMode) {
+        const mode = this.state.modeForPrefix[prefix];
+        const testMode = this.state.modeForPrefix[testPrefix];
+        if (this.state.supportedState.usermodepriority.length === 0 || !mode || !testMode) {
             return false;
         }
-        if (this.supportedState.usermodepriority.indexOf(mode) === -1 ||
-            this.supportedState.usermodepriority.indexOf(testMode) === -1) {
+        if (this.state.supportedState.usermodepriority.indexOf(mode) === -1 ||
+            this.state.supportedState.usermodepriority.indexOf(testMode) === -1) {
             return false;
         }
         // usermodepriority is a sorted string (lower index = more powerful)
-        return this.supportedState.usermodepriority.indexOf(mode) <
-            this.supportedState.usermodepriority.indexOf(testMode);
+        return this.state.supportedState.usermodepriority.indexOf(mode) <
+            this.state.supportedState.usermodepriority.indexOf(testMode);
     }
 
     public say(target: string, text: string) {
@@ -1651,7 +1696,7 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
 
     // Set user modes. If nick is falsey, your own user modes will be changed.
     // E.g. to set "+RiG" on yourself: setUserMode("+RiG")
-    public setUserMode(mode: string, nick: string = this.currentNick): Promise<void> {
+    public setUserMode(mode: string, nick: string = this.state.currentNick): Promise<void> {
         return this.send('MODE', nick, mode);
     }
 
@@ -1660,18 +1705,18 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
     }
 
     private _addWhoisData(nick: string, key: keyof(WhoisResponse), value: string|string[], onlyIfExists = false) {
-        if (onlyIfExists && !this.whoisData.has(nick)) {return;}
+        if (onlyIfExists && !this.state.whoisData.has(nick)) {return;}
         const data: WhoisResponse = {
-            ...this.whoisData.get(nick),
+            ...this.state.whoisData.get(nick),
             nick,
             [key]: value,
         };
-        this.whoisData.set(nick, data);
+        this.state.whoisData.set(nick, data);
     }
 
     private _clearWhoisData(nick: string) {
-        const data = this.whoisData.get(nick);
-        this.whoisData.delete(nick);
+        const data = this.state.whoisData.get(nick);
+        this.state.whoisData.delete(nick);
         return data;
     }
 
@@ -1730,13 +1775,6 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         return str;
     }
 
-    // blatantly stolen from irssi's splitlong.pl. Thanks, Bjoern Krombholz!
-    private _updateMaxLineLength(): void {
-        // 497 = 510 - (":" + "!" + " PRIVMSG " + " :").length;
-        // target is determined in _speak() and subtracted there
-        this._maxLineLength = 497 - this.nick.length - this.hostMask.length;
-    }
-
     // Checks the arg at the given index for a channel. If one exists, casemap it
     // according to ISUPPORT rules.
     private _casemap(msg: Message, index: number): string|undefined {
@@ -1749,18 +1787,18 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
     public toLowerCase(str: string): string {
         // http://www.irc.org/tech_docs/005.html
         const knownCaseMappings = ['ascii', 'rfc1459', 'strict-rfc1459'];
-        if (knownCaseMappings.indexOf(this.supportedState.casemapping) === -1) {
+        if (knownCaseMappings.indexOf(this.state.supportedState.casemapping) === -1) {
             return str;
         }
         let lower = str.toLowerCase();
-        if (this.supportedState.casemapping === 'rfc1459') {
+        if (this.state.supportedState.casemapping === 'rfc1459') {
             lower = lower.
                 replace(/\[/g, '{').
                 replace(/\]/g, '}').
                 replace(/\\/g, '|').
                 replace(/\^/g, '~');
         }
-        else if (this.supportedState.casemapping === 'strict-rfc1459') {
+        else if (this.state.supportedState.casemapping === 'strict-rfc1459') {
             lower = lower.
                 replace(/\[/g, '{').
                 replace(/\]/g, '}').

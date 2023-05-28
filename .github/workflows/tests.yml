@@ -1,5 +1,9 @@
 name: CI
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
     branches: [ master ]
@@ -10,43 +14,42 @@ jobs:
   lint:
    runs-on: ubuntu-latest
    steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: Use Node.js
-      uses: actions/setup-node@v1
+      uses: actions/setup-node@v3
       with:
-        node-version: 16
+        node-version-file: .node-version
     - run: yarn
     - run: yarn lint
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       matrix:
-        node_version: [16, 18]
+        node_version: [18, 20]
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - name: Use Node.js ${{ matrix.node_version }}
-        uses: actions/setup-node@v1
+        uses: actions/setup-node@v3
         with:
           node-version: ${{ matrix.node_version }}
       - run: yarn
       - run: yarn test
   integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      ircd:
+        image: ghcr.io/ergochat/ergo:stable
+        ports:
+          - 6667:6667
     strategy:
       matrix:
-        node_version: [16, 18]
-    steps:      
-      - uses: actions/checkout@v2
-      # Setup the IRCD
-      - name: Setup inspircd
-        run: |
-          sudo apt update
-          sudo apt install inspircd
-          sudo cp .github/support/inspircd.conf /etc/inspircd/inspircd.conf
-          sudo ls -l /etc/inspircd/
-          sudo inspircd --runasroot --nopid
+        node_version: [18, 20]
+    steps:
+      - uses: actions/checkout@v3
       - name: Use Node.js ${{ matrix.node_version }}
-        uses: actions/setup-node@v1
+        uses: actions/setup-node@v3
         with:
           node-version: ${{ matrix.node_version }}
       - run: yarn

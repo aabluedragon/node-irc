@@ -1,3 +1,28 @@
+2.0.0 (2023-04-26)
+==================
+
+NOTE: This release removes support for Node 16. Please update to Node 18 or greater.
+
+Features
+--------
+
+- Add support for splitting out the IRC connection state, and connecting via an existing socket. ([\#99](https://github.com/matrix-org/node-irc/issues/99))
+- Export utilities for testing against ircds. ([\#102](https://github.com/matrix-org/node-irc/issues/102))
+
+Deprecations and Removals
+-------------------------
+
+- Use `yarn` instead of `npm`, to be in-line with other matrix.org projects. ([\#95](https://github.com/matrix-org/node-irc/issues/95))
+- Add support for Node 20, and drop support for Node 16. ([\#100](https://github.com/matrix-org/node-irc/issues/100))
+
+
+Internal Changes
+----------------
+
+- Add support for testing against an actual IRCD. ([\#94](https://github.com/matrix-org/node-irc/issues/94))
+- Use ergo as our ircd of choice for automated testing. ([\#101](https://github.com/matrix-org/node-irc/issues/101))
+
+
 1.5.0 (2022-10-03)
 ==================
 

@@ -1,4 +1,5 @@
-import { ChanListItem, SaslErrors, WhoisResponse } from './irc';
+import { WhoisResponse } from "./state";
+import { ChanListItem, SaslErrors } from './irc';
 import { Message } from './parse_message';
 
 type IrcChannelName = string;

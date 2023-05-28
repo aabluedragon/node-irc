@@ -1,9 +1,11 @@
+import EventEmitter from "events";
 import { Message } from "./parse_message";
+import TypedEmitter from "typed-emitter";
 
 class Capabilities {
     constructor(
-        public caps = new Set<string>(),
-        public saslTypes = new Set<string>(),
+        public readonly caps = new Set<string>(),
+        public readonly saslTypes = new Set<string>(),
         public ready = false,
     ) {}
 
@@ -30,17 +32,35 @@ class Capabilities {
     }
 }
 
+type IrcCapabilitiesEventEmitter = TypedEmitter<{
+    serverCapabilitesReady: () => void,
+    userCapabilitesReady: () => void,
+}>;
+
+
 /**
  * A helper class to handle capabilities sent by the IRCd.
  */
-export class IrcCapabilities {
+export class IrcCapabilities extends (EventEmitter as new () => IrcCapabilitiesEventEmitter) {
     private serverCapabilites = new Capabilities();
     private userCapabilites = new Capabilities();
 
-    constructor(
-        private readonly onCapsList: () => void,
-        private readonly onCapsConfirmed: () => void) {
+    constructor(data?: ReturnType<IrcCapabilities["serialise"]>) {
+        super();
+        data?.serverCapabilites.forEach(v => this.serverCapabilites.caps.add(v));
+        data?.serverCapabilitesSasl.forEach(v => this.serverCapabilites.saslTypes.add(v));
+        data?.userCapabilites.forEach(v => this.serverCapabilites.caps.add(v));
+        data?.userCapabilitesSasl.forEach(v => this.userCapabilites.saslTypes.add(v));
+    }
 
+
+    public serialise() {
+        return {
+            serverCapabilites: [...this.serverCapabilites.caps.values()],
+            serverCapabilitesSasl: [...this.serverCapabilites.saslTypes.values()],
+            userCapabilites: [...this.userCapabilites.caps.values()],
+            userCapabilitesSasl: [...this.userCapabilites.saslTypes.values()],
+        }
     }
 
     public get capsReady() {
@@ -88,7 +108,7 @@ export class IrcCapabilities {
 
             if (this.serverCapabilites.ready) {
                 // We now need to request user caps
-                this.onCapsList();
+                this.emit('serverCapabilitesReady');
             }
         }
         // The target might be * or the nickname, for now just accept either.
@@ -96,7 +116,7 @@ export class IrcCapabilities {
             this.userCapabilites.extend(parts);
 
             if (this.userCapabilites.ready) {
-                this.onCapsConfirmed();
+                this.emit('userCapabilitesReady');
             }
         }
     }

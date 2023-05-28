@@ -1,11 +1,18 @@
-import { describe, expect, test } from '@jest/globals';
-import { IrcServer } from './util/irc-server';
+import { describe, beforeEach, afterEach, expect, test } from '@jest/globals';
+import { TestIrcServer } from '../src/testing';
 
-
-IrcServer.describe('Client', (server) => {
+describe('Client', () => {
+    let server: TestIrcServer;
+    beforeEach(() => {
+        server = new TestIrcServer();
+        return server.setUp();
+    });
+    afterEach(() => {
+        return server.tearDown();
+    })
     describe('joining channels', () => {
         test('will get a join event from a newly joined user', async () => {
-            const [speaker, listener] = server().clients;
+            const { speaker, listener } = server.clients;
 
             // Join the room and listen
             const listenerJoinPromise = listener.waitForEvent('join');
@@ -21,7 +28,7 @@ IrcServer.describe('Client', (server) => {
             expect(channel).toBe('#foobar');
         });
         test('can join a channel and send a message', async () => {
-            const [speaker, listener] = server().clients;
+            const { speaker, listener } = server.clients;
             await listener.join('#foobar');
             const messagePromise = listener.waitForEvent('message');
             await speaker.join('#foobar');
@@ -33,7 +40,7 @@ IrcServer.describe('Client', (server) => {
             expect(text).toBe('Hello world!');
         });
         test('will store channel information', async () => {
-            const [speaker] = server().clients;
+            const { speaker } = server.clients;
             expect(speaker.chanData('#foobar')).toBeUndefined();
             speaker.join('#foobar');
             await speaker.waitForEvent('join');
@@ -47,7 +54,7 @@ IrcServer.describe('Client', (server) => {
     });
     describe('mode changes', () => {
         test('will handle adding a parameter-less mode', async () => {
-            const [speaker] = server().clients;
+            const { speaker } = server.clients;
             await speaker.join('#foobar');
             await speaker.waitForEvent('join');
             speaker.send('MODE', '#foobar', '+m');
@@ -59,7 +66,7 @@ IrcServer.describe('Client', (server) => {
             expect(user).toBeUndefined();
         });
         test('will handle removing a parameter-less mode', async () => {
-            const [speaker] = server().clients;
+            const { speaker } = server.clients;
             await speaker.join('#foobar');
             await speaker.waitForEvent('join');
             await speaker.send('MODE', '#foobar', '+m');
@@ -72,7 +79,7 @@ IrcServer.describe('Client', (server) => {
             expect(user).toBeUndefined();
         });
         test('will handle adding a parameter mode', async () => {
-            const [speaker, listener] = server().clients;
+            const { speaker, listener } = server.clients;
             await speaker.join('#foobar');
             await listener.join('#foobar');
             await speaker.waitForEvent('join');
@@ -85,7 +92,7 @@ IrcServer.describe('Client', (server) => {
             expect(user).toBe(listener.nick);
         });
         test('will handle removing a parameter mode', async () => {
-            const [speaker, listener] = server().clients;
+            const { speaker, listener } = server.clients;
             await speaker.join('#foobar');
             await listener.join('#foobar');
             await speaker.waitForEvent('join');
