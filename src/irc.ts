@@ -1386,6 +1386,7 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
                 return;
             }
             const message = parseMessage(line, this.opt.stripColors);
+            message.buffer = buffers[i];
             try {
                 this.emit('raw', message);
             }
