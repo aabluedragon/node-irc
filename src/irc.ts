@@ -1381,7 +1381,8 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         // else, clear the buffer
         this.buffer = Buffer.alloc(0);
 
-        lines.forEach((line) => {
+        for(let i=0;i<lines.length;i++) {
+            const line = lines[i];
             if (!line.length) {
                 return;
             }
@@ -1395,7 +1396,7 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
                     throw err;
                 }
             }
-        });
+        }
     }
 
     private bindListeners(reconnectRetryCount: number) {
