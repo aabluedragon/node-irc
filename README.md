@@ -11,3 +11,5 @@ new Client('someServer','someNick', {
   ...
 })
 ```
+
+Since reconnection logic is broken in my master branch, use commit 1074955 until I have time to fix it.
