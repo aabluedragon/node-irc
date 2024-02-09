@@ -30,6 +30,7 @@ import splitLongLines from './splitLines';
 import TypedEmitter from "typed-emitter";
 import { ClientEvents, CtcpEventIndex, JoinEventIndex, MessageEventIndex, PartEventIndex } from './events';
 import { DefaultIrcSupported, IrcClientState, IrcInMemoryState, WhoisResponse } from './state';
+import { WebsocketWrapper } from './tswrapper';
 
 const lineDelimiter = new RegExp('\r\n|\r|\n');
 const MIN_DELAY_MS = 33;
@@ -69,6 +70,10 @@ export interface IrcClientOpts {
     encoding?: string|false;
     encodingFallback?: string;
     onNickConflict?: (maxLen?: number) => string,
+    websockets?: {
+        enable:boolean,
+        protocols?:string|string[]
+    }
     webirc?: {
         pass: string,
         ip: string,
@@ -1277,7 +1282,23 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         }
 
         // try to connect to the server
-        if (this.opt.secure && !this.conn) {
+        if(this?.opt?.websockets?.enable && !this.conn) {
+            let useAddress:string
+            try {
+                const url = new URL(this.server);
+                const lprotocol = url.protocol.toLowerCase();
+                if(!(lprotocol in ['ws:', 'wss:'])) {
+                    throw '';
+                }
+                useAddress = this.server;
+            } catch(e) {
+                useAddress = (this?.opt?.secure? 'wss://': 'ws://') + this.server
+                if(this.opt?.port) {
+                    useAddress += ':'+this.opt.port;
+                }
+            }
+            this.conn = new WebsocketWrapper(useAddress, this?.opt?.websockets?.protocols) as IrcConnection;
+        } else if (this.opt.secure && !this.conn) {
             let secureOpts: tls.ConnectionOptions = {
                 ...connectionOpts,
                 rejectUnauthorized: !(this.opt.selfSigned || this.opt.certExpired),
@@ -1362,10 +1383,6 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
 
         const lines = this.convertEncoding(this.buffer).toString().split(lineDelimiter);
 
-        if (lines.pop()) {
-            // if buffer is not ended with \r\n, there's more chunks.
-            return;
-        }
         // else, clear the buffer
         this.buffer = Buffer.alloc(0);
 
