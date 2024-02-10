@@ -18,6 +18,7 @@
     along with this library.  If not, see <http://www.gnu.org/licenses/>.
 */
 import type * as dns from 'dns'
+import type * as net from 'net';
 import type { TcpNetConnectOpts } from 'net';
 import type * as tls from 'tls';
 
@@ -50,9 +51,6 @@ import { EventEmitter } from './event_emitter';
 
 const lineDelimiter = new RegExp('\r\n|\r|\n');
 const MIN_DELAY_MS = 33;
-
-let Iconv:typeof IconvType
-let detectCharset:typeof detectCharsetType
 
 export interface ChanListItem {
     name: string;
@@ -1237,7 +1235,7 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         this.emit('connect');
     }
 
-    public async connect(retryCountOrCallBack?: number|(() => void), callback?: () => void) {
+    public connect(retryCountOrCallBack?: number|(() => void), callback?: () => void) {
         let retryCount: number;
         if (typeof retryCountOrCallBack === 'function') {
             callback = retryCountOrCallBack;
@@ -1270,8 +1268,8 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
             //   isn't what we want for proper load balancing. With this option set
             //   we'll randomise the list of all results so that we can spread load
             //   between all the servers.
-            connectionOpts.lookup = async (hostname, options, lookupCb) => {
-                const DNS = await import('dns');
+            connectionOpts.lookup = (hostname, options, lookupCb) => {
+                const DNS = require('dns') as typeof dns;
                 DNS.lookup(hostname, {all: true, ...options}, (err, addresses) => {
                     // @types/node doesn't provision for an all callback response, so we have to
                     // do some unsafe typing here.
@@ -1307,11 +1305,6 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
             this.conn = undefined;
         }
 
-        if(!this.isUsingWebsockets) {
-            if(!Iconv) Iconv = await import('iconv-lite');
-            if(!detectCharset) detectCharset = await import('chardet');
-        }
-
         // try to connect to the server
         if(this.isUsingWebsockets && !this.conn) {
             let useAddress:string
@@ -1343,7 +1336,7 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
                 };
             }
 
-            const TLS = await import('tls');
+            const TLS = require('tls') as typeof tls;
 
             const tlscon: tls.TLSSocket = TLS.connect(secureOpts, () => {
                 if (tlscon === undefined) {
@@ -1385,7 +1378,7 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
             this.conn = tlscon as IrcConnection;
         }
         else if (!this.conn) {
-            const NET = await import('net');
+            const NET = require('net') as typeof net;
             this.conn = NET.createConnection(connectionOpts) as IrcConnection;
         }
 
@@ -1830,6 +1823,9 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         const str = buffer.toString();
         if (this.opt.encoding) {
             try {
+                const Iconv:typeof IconvType = require('iconv-lite');
+                const detectCharset:typeof detectCharsetType = require('chardet');
+
                 const charset = detectCharset.detect(buffer);
                 if (!charset) {
                     throw Error("No charset detected");
@@ -1846,6 +1842,7 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         else if (this.opt.encodingFallback) {
             try {
                 if (!isValidUTF8(buffer)) {
+                    const Iconv:typeof IconvType = require('iconv-lite');
                     return Iconv.decode(buffer, this.opt.encodingFallback).toString();
                 }
             }

@@ -1,5 +1,8 @@
 [![License](https://img.shields.io/badge/license-GPLv3-blue.svg?style=flat)](http://opensource.org/licenses/GPL-3.0)
 
+WebSockets support added.
+Use ws_raw_buffer branch.
+
 This is a fork of [node-irc](http://node-irc.readthedocs.org/), which is an IRC client library written in TypeScript for [Node](http://nodejs.org/). This fork is used by the [Matrix-IRC application service](http://github.com/matrix-org/matrix-appservice-irc).
 
 To use this package:
