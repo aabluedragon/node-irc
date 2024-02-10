@@ -11,6 +11,7 @@ export interface Message {
     command?: string;
     rawCommand?: string;
     commandType: CommandType;
+    buffer?: Uint8Array
 }
 
 /**
