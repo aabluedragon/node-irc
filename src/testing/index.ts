@@ -1,8 +1,26 @@
-import { randomUUID } from 'crypto';
+import type * as cryptoType from 'crypto';
 import { Client, ClientEvents, IrcClientOpts, Message } from '..';
 
-const DEFAULT_PORT = parseInt(process.env.IRC_TEST_PORT ?? '6667', 10);
-const DEFAULT_ADDRESS = process.env.IRC_TEST_ADDRESS ?? "127.0.0.1";
+const DEFAULT_PORT = (()=>{
+    let port:number|undefined = undefined;
+    try {
+        port = parseInt(process.env.IRC_TEST_PORT as string, 10);
+    } catch(e) {}
+    if(!port || port == undefined) {
+        port = 6667;
+    }
+    return port;
+})();
+const DEFAULT_ADDRESS = (()=>{
+    let address:string|undefined = undefined;
+    try {
+        address = process.env.IRC_TEST_ADDRESS;
+    } catch(e) {}
+    if(!address || !address?.length) {
+        address = '127.0.0.1';
+    }
+    return address;
+})();
 
 /**
  * Exposes a client instance with helper methods to listen
@@ -11,7 +29,7 @@ const DEFAULT_ADDRESS = process.env.IRC_TEST_ADDRESS ?? "127.0.0.1";
 export class TestClient extends Client {
     public readonly errors: Message[] = [];
 
-    public connect(fn?: () => void) {
+    public async connect(fn?: () => void) {
         // These can be IRC errors which aren't fatal to tests.
         this.on('error', msg => this.errors.push(msg));
         super.connect(fn);
@@ -68,7 +86,7 @@ export class TestClient extends Client {
 export class TestIrcServer {
 
     static generateUniqueNick(name = 'default') {
-        return `${name}-${randomUUID().replace('-', '').substring(0, 8)}`;
+        return `${name}-${TestIrcServer.crypto!.randomUUID().replace('-', '').substring(0, 8)}`;
     }
     static generateUniqueChannel(name = 'default') {
         return `#${this.generateUniqueNick(name)}`;
@@ -80,7 +98,14 @@ export class TestIrcServer {
         public readonly customConfig: Partial<IrcClientOpts> = {}
     ) { }
 
+    static crypto?: typeof cryptoType
+
     async setUp(clients = ['speaker', 'listener']) {
+
+        if(!TestIrcServer?.crypto) {
+            TestIrcServer.crypto = await import('crypto');
+        }
+
         const connections: Promise<void>[] = [];
         for (const clientName of clients) {
             const client =

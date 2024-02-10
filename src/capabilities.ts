@@ -1,4 +1,7 @@
-import EventEmitter from "events";
+
+
+
+import { EventEmitter } from "./event_emitter";
 import { Message } from "./parse_message";
 import TypedEmitter from "typed-emitter";
 

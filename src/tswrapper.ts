@@ -1,25 +1,42 @@
+import { EventEmitter } from './event_emitter';
 import {IrcConnection, IrcConnectionEventsMap} from './irc'
 import {IMessageEvent, w3cwebsocket} from 'websocket';
-
-// using 'events' module from npm, for browser compatibility
-
-// @ts-ignore
-import * as PortableEventEmitterModule from '../node_modules/events/events'; 
 import type {EventEmitter as EventEmitterType} from 'events'
 
-const EventEmitter:typeof EventEmitterType = (()=>{
-    if(PortableEventEmitterModule?.default) {
-        return PortableEventEmitterModule.default;
-    }
-    return PortableEventEmitterModule;
-})();
-
-export class WebsocketWrapper extends w3cwebsocket implements IrcConnection {
+export class WebsocketWrapper implements IrcConnection {
 
     #timeoutMS: number|undefined = undefined;
     #timeoutTimer: any = undefined;
     ee: EventEmitterType = new EventEmitter();
+    ws: w3cwebsocket;
 
+    constructor(remote:string, protocols:string|string[]|undefined) {
+        this.ws = new w3cwebsocket(remote, protocols);
+
+        this.extendTimeoutTimer();
+
+        this.ws.onopen = ()=>{
+            this.extendTimeoutTimer();
+            this.ee.emit('connect');
+        }
+
+        this.ws.onclose = ()=>{
+            this.ee.emit('end');
+            this.ee.emit('close');
+            this.dismissTimeoutTimer();
+        }
+
+        this.ws.onerror = (ev:Error)=>{
+            this.ee.emit('error', ev);
+            this.dismissTimeoutTimer();
+        }
+        this.ws.onmessage = (ev:IMessageEvent)=>{
+            this.extendTimeoutTimer();
+            this.ee.emit('data', ev?.data);
+        }
+    }
+
+    
     extendTimeoutTimer() {
         if(this.#timeoutMS === null || this.#timeoutMS === undefined) return;
 
@@ -35,48 +52,22 @@ export class WebsocketWrapper extends w3cwebsocket implements IrcConnection {
         this.#timeoutTimer = undefined;
     }
 
-    constructor(remote:string, protocols:string|string[]|undefined) {
-        super(remote, protocols);
-
-        this.extendTimeoutTimer();
-
-        this.onopen = ()=>{
-            this.extendTimeoutTimer();
-            this.ee.emit('connect');
-        }
-
-        this.onclose = ()=>{
-            this.ee.emit('end');
-            this.ee.emit('close');
-            this.dismissTimeoutTimer();
-        }
-
-        this.onerror = (ev:Error)=>{
-            this.ee.emit('error', ev);
-            this.dismissTimeoutTimer();
-        }
-        this.onmessage = (ev:IMessageEvent)=>{
-            this.extendTimeoutTimer();
-            this.ee.emit('data', ev?.data);
-        }
-    }
-
     //
     // IrcConnection
     //
     get connecting() {
-        return this.readyState == w3cwebsocket.CONNECTING;
+        return this.ws.readyState == w3cwebsocket.CONNECTING;
     };
     setTimeout(timeoutMS?: number|undefined): void {
         this.#timeoutMS = timeoutMS;
         this.extendTimeoutTimer(); 
     }
     destroy():void {
-        super.close();
+        this.ws.close();
     }
     write(data: string): void {
         this.extendTimeoutTimer();
-        super.send(data);
+        this.ws.send(data);
     }
     end(): void {
         // Cannot send FIN packet in Websockets, so just destroy.

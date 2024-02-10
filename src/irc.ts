@@ -17,23 +17,42 @@
     You should have received a copy of the GNU General Public License
     along with this library.  If not, see <http://www.gnu.org/licenses/>.
 */
-import * as dns from 'dns';
-import { createConnection, TcpNetConnectOpts } from 'net';
-import * as tls from 'tls';
-import * as util from 'util';
+import type * as dns from 'dns'
+import type { TcpNetConnectOpts } from 'net';
+import type * as tls from 'tls';
+
+const util = {
+    log(...args:any[]) {
+        console.log(...args);
+    },
+    inspect(obj:any) {
+        return JSON.stringify(obj);
+    }
+}
+
+import {Buffer} from 'buffer';
+try {
+    if(!window?.Buffer) {
+        (window as any)['Buffer'] = Buffer;
+    }
+} catch(e) {}
+
 import isValidUTF8 from 'utf-8-validate';
-import { EventEmitter } from 'events';
-import * as Iconv from 'iconv-lite';
-import * as detectCharset from 'chardet';
+import type * as IconvType from 'iconv-lite';
+import type * as detectCharsetType from 'chardet';
 import { Message, parseMessage } from './parse_message';
 import splitLongLines from './splitLines';
 import TypedEmitter from "typed-emitter";
 import { ClientEvents, CtcpEventIndex, JoinEventIndex, MessageEventIndex, PartEventIndex } from './events';
 import { DefaultIrcSupported, IrcClientState, IrcInMemoryState, WhoisResponse } from './state';
 import { WebsocketWrapper } from './tswrapper';
+import { EventEmitter } from './event_emitter';
 
 const lineDelimiter = new RegExp('\r\n|\r|\n');
 const MIN_DELAY_MS = 33;
+
+let Iconv:typeof IconvType
+let detectCharset:typeof detectCharsetType
 
 export interface ChanListItem {
     name: string;
@@ -201,11 +220,17 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         return this.state.loggedIn;
     }
 
+    isUsingWebsockets:boolean
+
     constructor (
         private server: string, requestedNick: string, opt: IrcClientOpts, existingState?: IrcClientState,
         public conn?: IrcConnection
     ) {
         super();
+
+        const lServer = server.toLowerCase();
+        this.isUsingWebsockets = opt?.websockets?.enable || lServer.startsWith('ws://') || lServer.startsWith('wss://');
+
         if (!existingState) {
             this.state = new IrcInMemoryState(
                 DefaultIrcSupported,
@@ -1212,7 +1237,7 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         this.emit('connect');
     }
 
-    public connect(retryCountOrCallBack?: number|(() => void), callback?: () => void) {
+    public async connect(retryCountOrCallBack?: number|(() => void), callback?: () => void) {
         let retryCount: number;
         if (typeof retryCountOrCallBack === 'function') {
             callback = retryCountOrCallBack;
@@ -1245,8 +1270,9 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
             //   isn't what we want for proper load balancing. With this option set
             //   we'll randomise the list of all results so that we can spread load
             //   between all the servers.
-            connectionOpts.lookup = (hostname, options, lookupCb) => {
-                dns.lookup(hostname, {all: true, ...options}, (err, addresses) => {
+            connectionOpts.lookup = async (hostname, options, lookupCb) => {
+                const DNS = await import('dns');
+                DNS.lookup(hostname, {all: true, ...options}, (err, addresses) => {
                     // @types/node doesn't provision for an all callback response, so we have to
                     // do some unsafe typing here.
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1281,8 +1307,13 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
             this.conn = undefined;
         }
 
+        if(!this.isUsingWebsockets) {
+            if(!Iconv) Iconv = await import('iconv-lite');
+            if(!detectCharset) detectCharset = await import('chardet');
+        }
+
         // try to connect to the server
-        if(this?.opt?.websockets?.enable && !this.conn) {
+        if(this.isUsingWebsockets && !this.conn) {
             let useAddress:string
             try {
                 const url = new URL(this.server);
@@ -1312,11 +1343,13 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
                 };
             }
 
-            const tlscon: tls.TLSSocket = tls.connect(secureOpts, () => {
+            const TLS = await import('tls');
+
+            const tlscon: tls.TLSSocket = TLS.connect(secureOpts, () => {
                 if (tlscon === undefined) {
                     throw Error('Conn was not defined');
                 }
-                if (!(tlscon instanceof tls.TLSSocket)) {
+                if (!(tlscon instanceof TLS.TLSSocket)) {
                     throw Error('Conn was not a TLSSocket');
                 }
 
@@ -1352,7 +1385,8 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
             this.conn = tlscon as IrcConnection;
         }
         else if (!this.conn) {
-            this.conn = createConnection(connectionOpts) as IrcConnection;
+            const NET = await import('net');
+            this.conn = NET.createConnection(connectionOpts) as IrcConnection;
         }
 
 
@@ -1381,7 +1415,19 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         }
         this.buffer = Buffer.concat([this.buffer, chunk]);
 
-        const lines = this.convertEncoding(this.buffer).toString().split(lineDelimiter);
+        const lines = 
+            (this.isUsingWebsockets?
+                this.buffer.toString('utf-8'):
+                this.convertEncoding(this.buffer).toString()).
+            split(lineDelimiter);
+
+        if(!this.isUsingWebsockets) {
+            if (lines.pop()) {
+                // if buffer is not ended with \r\n, there's more chunks.
+                return;
+            }
+            // in websockets mode, \r\n might be missing, so we don't pop.
+        }
 
         // else, clear the buffer
         this.buffer = Buffer.alloc(0);
