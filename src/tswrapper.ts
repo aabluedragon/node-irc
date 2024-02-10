@@ -3,15 +3,23 @@ import {IrcConnection, IrcConnectionEventsMap} from './irc'
 import {IMessageEvent, w3cwebsocket} from 'websocket';
 import type {EventEmitter as EventEmitterType} from 'events'
 
+const hasBrowserWebsocket = (()=>{
+    try {
+        return window.WebSocket != null;
+    } catch(e) {
+        return false
+    }
+})();
+
 export class WebsocketWrapper implements IrcConnection {
 
     #timeoutMS: number|undefined = undefined;
     #timeoutTimer: any = undefined;
     ee: EventEmitterType = new EventEmitter();
-    ws: w3cwebsocket;
+    ws: w3cwebsocket|WebSocket;
 
     constructor(remote:string, protocols:string|string[]|undefined) {
-        this.ws = new w3cwebsocket(remote, protocols);
+        this.ws = hasBrowserWebsocket? new WebSocket(remote, protocols) : new w3cwebsocket(remote, protocols);
 
         this.extendTimeoutTimer();
 
